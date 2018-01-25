@@ -1,0 +1,487 @@
+---
+title: "R Meetup Demo"
+author: "Simona Picardi"
+date: "January 31, 2018"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align="center")
+```
+
+# Intro
+
+This demo provides a general introduction to handling movement data in R using the package adehabitatLT, and illustrates an example of analytical application of First Passage Time for path segmentation purposes. The dataset consists of 6 year-long trajectories of GPS-tracked Wood Storks in Florida. Please do not use the data provided for any purpose other than this exercise. 
+
+# Setup
+
+```{r dataset, include=FALSE}
+
+# This is the code I used to select the dataset for this demo. I kept it here just for personal record.
+# 
+# locs_demo <- locs[locs$animal_id %in% c("1134370", "1134400", "851260", "910200", "910220", "910230"),] ## OLD
+# 
+# locs_demo <- locs[locs$animal_id %in% c("1134370") & year(locs$acquisition_time)==2014 | 
+#                     locs$animal_id %in% c("1134400") & year(locs$acquisition_time)==2013 |
+#                     locs$animal_id %in% c("851260") & year(locs$acquisition_time)==2009 |
+#                     locs$animal_id %in% c("910200") & year(locs$acquisition_time)==2010 |
+#                     locs$animal_id %in% c("910220") & year(locs$acquisition_time)==2012 |
+#                     locs$animal_id %in% c("910230") & year(locs$acquisition_time)==2010,]
+# saveRDS(locs_demo, "locs_demo.rds")
+
+```
+
+Packages you will need:
+
+```{r install packages, eval=FALSE}
+
+install.packages("adehabitatLT", 
+                 "lubridate", 
+                 "raster", 
+                 "rworldmap", 
+                 "sp")
+
+```
+
+```{r load packages, results="hide", message=FALSE}
+
+library("adehabitatLT")
+library("lubridate")
+library("raster")
+library("rworldmap")
+library("sp")
+
+```
+
+Import the data (.rds file):
+
+```{r import data}
+
+locs_demo <- readRDS("locs_demo.rds")
+head(locs_demo)
+
+```
+
+# Creating a Trajectory Object
+
+First, I convert the locations into a SpatialPointsDataFrame and assign them a projection. 
+
+```{r spdf}
+
+class(locs_demo)
+
+locs_demo <- locs_demo[!is.na(locs_demo$x),]
+locs_demo <- locs_demo[!is.na(locs_demo$y),]
+
+coordinates(locs_demo) <- c("x", "y")
+
+class(locs_demo)
+
+proj4string(locs_demo) <- CRS("+init=epsg:32617")
+
+```
+
+Second, I create an ltraj object. Ltraj is a class of objects introduced in the adehabitatLT package, intended for storing movement trajectories. Trajectories can be of two types: 
+
+- Type 1: time not recorded. In this case, the chronological order of the locations is known, but the exact time is not (e.g., tracks in snow). 
+- Type 2: time recorded. Each location has an associated timestamp (e.g., radio- or satellite tracking). Within Type 2 trajectories, there can be irregular or regular ones (according to whether the time lag between locations is variable or constant).
+
+We are going to work with Type 2 trajectories. 
+
+For the as.ltraj() function to run, the date needs to be a POSIXct object. In this case, the date is already in that format. 
+
+```{r posixct}
+
+class(locs_demo$acquisition_time)
+
+```
+
+If it was not, I would have had to convert it as follows:
+
+```{r posixct convert}
+
+# locs_demo$acquisition_time <- as.POSIXct(strptime(as.character(locs_demo$acquisition_time), "%y%m%d", tz="EST"))
+
+```
+
+We can now create the ltraj object. I will call this "raw" because for now I am ignoring the sampling regime. This "raw" ltraj object will be useful to take a look at the data before I regularize the trajectories. 
+
+```{r ltraj}
+
+raw_wost <- as.ltraj(coordinates(locs_demo),date=locs_demo$acquisition_time,id=locs_demo$animal_id, typeII=TRUE)
+
+is.regular(raw_wost)
+
+```
+
+The resulting object belongs to the classes "ltraj" and "list". It is, indeed, a list of data frames, and thus it behaves as any other list in R for handling purposes. 
+
+```{r ltraj list}
+
+raw_wost
+
+class(raw_wost)
+
+```
+
+Using single square brackets, we can isolate single elements of the list (note that this way we still obtain an object of class "ltraj" and "list"). 
+
+```{r ltraj list element}
+
+raw_wost[1]
+
+class(raw_wost[1])
+
+```
+
+Using double square brackets, we can access the information inside each element of the list (in this case, each element is a data frame). 
+
+```{r ltraj content}
+
+head(raw_wost[[1]])
+
+class(raw_wost[[1]])
+
+```
+
+# Regularization of Movement Trajectories
+
+The next step is the regularization of the trajectories. To do this, I need to set some rules concerning the sampling regime, so that I end up with trajectories composed by locations evenly spaced in time. This will involve two steps: adding missing locations where a fix was expected but did not happen, and rounding the timestamp of locations that were collected approximately when expected. 
+
+These 6 tags were programmed with a 1-hour sampling schedule. So, first, I want to make sure that there is a record every hour. Every time a fix was expected and the tag failed to collect a location, I am going to add a missing value using the function setNA(). To do so, I need to define a reference timestamp. Missing values will be placed at integer multiples of the expected lag time with respect to the reference timestamp. For simplicity, I will use the earliest timestamp found in the dataset as a reference. (Note that, in case the lag time is not 1 hour, it might be better to define an individual-based reference timestamp to avoid accidental schedule shiftings).
+
+```{r regularize NA}
+
+refda <- min(locs_demo$acquisition_time)
+wost_NA <- setNA(raw_wost,refda,1,units="hour")
+
+```
+
+Second, I want to make sure that the timestamp associated with each location is exactly at the expected time. It often happens that locations are taken approximately at the programmed time, plus or minus a few seconds/minutes. I want to round the timestamps so that they are *exactly* one hour apart from each other, rather than *approximately* one hour apart. Again, timestamps are rounded with respect to a reference time. I will use the function sett0().
+
+```{r regularize 0}
+
+wost_demo <- sett0(wost_NA,refda,1,units="hour")
+
+is.regular(wost_demo)
+
+```
+
+# Exploration of Movement Trajectories
+
+## Plot Trajectories
+
+The first thing we want to do is take a look at the trajectories. Plotting them is really easy:
+
+```{r plotraj}
+  
+plot.ltraj(wost_demo)
+
+```
+
+...but not very informative without a map on the background. Let's go ahead and add one.
+
+We can load a high-resolution map using the package rworldmap, then crop it to the area of interest. I am going to use the maximum and minimum coordinates in the dataset to define a bounding box (first I need to transform from UTMs to lat/long). Then I will crop the world map using the bounding box and back-transform it into UTMs.
+
+```{r plot wmap, results="hide"}
+
+map_gen <- getMap(resolution="high")[-which(getMap()$ADMIN=='Antarctica'),]
+# Not excluding Antarctica apparently creates issues 
+
+locs_ll <- spTransform(locs_demo, CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"))
+
+map_ext <- extent(min(locs_ll$longitude),max(locs_ll$longitude),
+                 min(locs_ll$latitude),max(locs_ll$latitude))
+bbox <- bbox(map_ext)
+bbox <- as.data.frame(t(bbox))
+coordinates(bbox) <- ~s1+s2
+
+proj4string(bbox) <- CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+# Assign projection to the bounding box (same as map_gen)
+
+map_crop <- map_gen[bbox,]
+map_crop <- spTransform(map_crop, CRS("+init=epsg:32617"))
+
+par(mfrow=c(2,3))
+plot.ltraj(wost_demo[1], main=burst(wost_demo[1]), spoldf=map_crop, colspoldf="cornsilk")
+plot.ltraj(wost_demo[2], main=burst(wost_demo[2]), spoldf=map_crop, colspoldf="cornsilk")
+plot.ltraj(wost_demo[3], main=burst(wost_demo[3]), spoldf=map_crop, colspoldf="cornsilk")
+plot.ltraj(wost_demo[4], main=burst(wost_demo[4]), spoldf=map_crop, colspoldf="cornsilk")
+plot.ltraj(wost_demo[5], main=burst(wost_demo[5]), spoldf=map_crop, colspoldf="cornsilk")
+plot.ltraj(wost_demo[6], main=burst(wost_demo[6]), spoldf=map_crop, colspoldf="cornsilk")
+dev.off()
+
+```
+
+## Explore Trajectory Parameters
+
+What is really neat about ltraj objects is that, the moment you create one, the function automatically computes a series of trajectory parameters. 
+
+```{r param}
+
+wost_demo
+head(wost_demo[[1]])
+
+```
+
+Each row in an individual data frame corresponds to a location, with an associated pair of coordinates and timestamp. In addition to that, the as.ltraj() function calculated:
+
+- The values of "dx" and "dy", i.e. the increments along each axis between the present location and the consecutive one; 
+- The step length ("dist"), i.e. the euclidean distance between the present location and the consecutive one;
+- The lag time "dt", i.e. the time interval between one location and the next (expressed in seconds); 
+- The net squared displacement "R2n", i.e. the euclidean distance betwen the present location and the starting location of the trajectory; 
+- The absolute angle "abs.angle", i.e. the angle between the present step and the x-axis
+- The relative or turning angle "rel.angle", i.e. the angle between the present step and the consecutive one. 
+
+There are some built-in functions in the adehabitatLT package to explore trajectory parameters. For example, we can plot a time series of a parameter of interest, e.g. the step length:
+
+```{r slts}
+
+plotltr(wost_demo, which="dist")
+
+```
+
+Or, we might want to make our own custom graphs - for example we might want to look at a histogram of a parameter of interest. Luckily it is really straightforward to convert an ltraj object into a data frame and easily access and manage the data using familiar syntaxes. 
+
+```{r traj2df}
+
+wost_df <- ld(wost_demo)
+head(wost_df)
+
+wost_demo_bt <- dl(wost_df)
+wost_demo_bt
+
+identical(wost_demo, wost_demo_bt)
+
+```
+
+Let's make some histograms of net squared displacement, as an example. 
+
+```{r perind}
+
+perind <- split(wost_df, wost_df$id)
+# First I split the df into a list of individual data frames
+class(perind)
+
+```
+
+```{r plot nsd, results="hide"}
+plotNSD <- function(x) {
+  hist(x$R2n, breaks=15, xlab="NSD", main=paste0("NSD ", unique(x$id), " n=", nrow(x[!is.na(x$R2n),])))
+}
+
+par(mfrow=c(2,3))
+lapply(perind, plotNSD)
+dev.off()
+
+```
+
+Or some rose diagrams of turning angles:
+
+```{r rosediag, results="hide"}
+
+plotRA <- function(x) {
+  rose.diag(x[!is.na(x$rel.angle),]$rel.angle, bins=24, prop=2, main=paste0("Rel.Angles ", unique(x$id), " n=", nrow(x[!is.na(x$rel.angle),])))
+}
+
+par(mfrow=c(2,3))
+lapply(perind, plotRA)
+dev.off()
+
+```
+
+# First Passage Time Analysis
+
+First Passage Time is a measure of the time it takes for an individual to enter and leave a circle of fixed radius drawn around each location of a trajectory (Fauchald & Tveraa 2003). FPT quantifies the intensity of space use around each location, and it was introduced as a tool to identify the spatial scale at which animals interact with the landscape. FPT analysis was first applied to identify area-restricted search (ARS) movements within a movement trajectory, but has later been applied to identify interaction with the landscape at multiple scales, in a nested fashion. 
+
+First Passage Time analysis consists in calculating FPT along a trajectory using circles of different radii. Within the chosen range of radii, the variance of FPT will be higher for some values and smaller for others. The variance of FPT peaks at the radius (i.e., spatial scale) at which the animal interacts with the landscape. Within a large enough array of radii, we can observe several peaks - each corresponding to a different scale of interaction. 
+
+Let's look at an example. Suppose we want to identify the spatial scale at which Wood Storks forage - or in other words, how big of an area they cover while searching for food. We need to choose a range of possible radii that encompasses reasonable spatial scales for Wood Stork foraging behavior. Since we are focusing on a relatively small-scale behavior, let's say we consider circles with radii ranging from 5 to 500 meters. We then compute FPT at each location in the trajectory for each of the radii in our chosen interval. 
+
+We then plot a variogram of FPT in function of the considered range of radii. We expect to observe a peak in variance corresponding to the spatial scale at which searching behavior happens. Once the spatial scale of interest has been identified, we can plot FPT at that scale to detect bouts of foraging behavior.
+
+```{r fpt small}
+
+wost_fpt1 <- fpt(wost_demo, radii=5:500, units="hours")
+varlogfpt(wost_fpt1, graph=TRUE)
+meanfpt(wost_fpt1, graph=TRUE)
+plot(wost_fpt1, scale=25)
+
+```
+
+Since our demo dataset consists of yearly trajectories, it is difficult to eye-ball foraging behavior bouts just by looking at the graphs, because of their small temporal scale. 
+
+Let's try to focus on a larger scale behavior: migration vs home range residency. FPT analysis can be used to identify the spatial scale of seasonal ranges in migratory animals. Similarly to area-restricted search, but at a larger spatio-temporal scale, home range residency consists in the prolonged permanence within a relatively small area. Using the same rationale as we did for foraging behavior, let's repeat the operations above on a different range of spatial scales, adjusting it to the behavior we are interested in this time. For example, we might want to look at radii ranging from 1 to 100 km. 
+
+```{r fpt large}
+
+wost_fpt2 <- fpt(wost_demo, radii=seq(1000, 100000, by=1000), units="hours")
+varlogfpt(wost_fpt2, graph=TRUE)
+
+```
+
+This time, the variograms are less similar between individuals. This is because there is much more variability between individuals in the scale of their home range residency patterns than there is in the scale of foraging behavior. In other words, all Wood Storks search more or less at the same spatial scale while foraging, but they can vary widely in the spatial scale of their home range movements. 
+
+The first individual in our dataset (1134370, top-left graph) seems to have a clearer peak of FPT variance than the others. Let's look at this individual as an illustrative example. 
+
+```{r fpt ind}
+
+fpt_4370 <- fpt(wost_demo[1], radii=seq(1000, 100000, by=1000), units="hours")
+varlogfpt(fpt_4370, graph=TRUE)
+
+```
+
+Wood Stork 1134370 shows a peak in the variance of FPT at a radius of approximately 45 km. Let's plot a time series of FPT at that scale:
+
+```{r fpt ind scale}
+
+plot(fpt_4370, scale=45000)
+
+```
+
+This graph suggests that the trajectory of Wood Stork 1134370 is composed of three segments: an initial segment corresponding to low FPT values (fast/directed movement), a central part corresponding to high FPT values (slow/localized movement), and a final segment with low FPT values again (fast/directed movement). This pattern could be interpreted, for example, as a migration bout, followed by a phase of residency in a seasonal home range, followed by another migration. 
+
+# Path segmentation
+
+## Segmentation based on First Passage Time 
+
+First Passage Time can be used as a signal for the segmentation of trajectories in the Behavioral Change Point Analysis framework. BCPA methods are used to detect significant change points along the time series of a signal of choice. Theoretically any movement parameter can be used as a signal, but according to the behaviors that one is trying to separate some signals can be more informative than others and allow more accurate segmentation. FPT is a good signal to discriminate between segments of fast, directed movement and segments of slow, localized movement. Being a type of time series analysis, BCPA takes into account the temporal autocorrelation of path signals.
+
+Let's try to apply BCPA to the segmentation of the trajectory of Wood Stork 1134370 using FPT at 45 km as a signal. The algorithm that we are going to use to detect change points was introduced by Lavielle (1999, 2005). This method looks for the optimal segmentation of a trajectory by minimizing a contrast function, i.e., a function measuring the discrepancy between the observed time series and the underlying model. For example, we can set our analysis assuming that different segments will differ in the mean of the signal of interest, or in its standard deviation, or in both mean and standard deviation. According to what model we assume a priori, we are going to use a different contrast function. For a given number of segments, the algorithm finds the segmentation for which the contrast function is minimized. 
+
+The Lavielle method requires us to define three parameters:
+
+- The minimum number of locations that a segment needs to be composed of;
+- The maximum number of segments that we allow within the entire trajectory;
+- The type of contrast function we want to use (based on mean, standard deviation, or both).
+
+The algorithm will scan the time series of a signal of choice (in our case, the 45 km radius FPT) using a moving window of our specified size Lmin, looking for segments that differ from the consecutive ones in the path signal parameter of choice (in our case, the mean), up until a maximum of Kmax segments. We are going to require a segment to be composed of at least 10 steps, and we are going to allow a maximum of 10 segments. 
+
+Before we run the segmentation, let's add a column for FPT into the ltraj object. We need to convert the ltraj back in a data frame, get rid of NAs, bind the FPT values, convert back into an ltraj and regularize the trajectory again. 
+
+```{r lavielle, results="hide"}
+
+df_4370 <- ld(wost_demo[1])
+df_4370 <- df_4370[!is.na(df_4370$x),]
+df_4370 <- df_4370[!is.na(df_4370$y),]
+
+df_4370$fpt_r45 <- fpt_4370[[1]]$r45
+
+traj_4370 <- dl(df_4370)
+# regularize again
+traj_4370 <- setNA(traj_4370,refda,1,units="hour")
+traj_4370 <- sett0(traj_4370,refda,1,units="hour")
+
+# To access infolocs:
+# infolocs(traj_4370)[[1]]$fpt_r45
+
+lav_4370 <- lavielle(traj_4370, Lmin=10, Kmax=10, type="mean", which="fpt_r45")
+chooseseg(lav_4370)
+
+```
+
+The scree plot shows the decrease of the contrast function as a function of the number of segments. We want to pick the value of number of segments past which the slope of the curve stops decreasing sharply. In our case, that corresponds to K=3 segments. 
+
+Now, we want to see the results of the segmentation with K=3. Let's go ahead and look at where the algorithm places the breaks between segments along the FPT time series. 
+
+```{r seg}
+
+seg_4370 <- findpath(lav_4370, 3)
+
+```
+
+The result of the segmentation confirms our initial visual assessment. Let's see what this corresponds to in terms of trajectory splitting:
+
+```{r split, results="hide"}
+
+plot(seg_4370)
+
+par(mfrow=c(1,3))
+plot(seg_4370[1],ylim=c(2800000,3700000),xlim=c(300000,700000))
+plot(seg_4370[2],ylim=c(2800000,3700000),xlim=c(300000,700000))
+plot(seg_4370[3],ylim=c(2800000,3700000),xlim=c(300000,700000))
+dev.off()
+
+```
+
+```{r split map, results="hide"}
+
+par(mfrow=c(1,3))
+plot(seg_4370[1],ylim=c(2800000,3700000),xlim=c(300000,700000), spoldf=map_crop, colspoldf="cornsilk")
+plot(seg_4370[2],ylim=c(2800000,3700000),xlim=c(300000,700000), spoldf=map_crop, colspoldf="cornsilk")
+plot(seg_4370[3],ylim=c(2800000,3700000),xlim=c(300000,700000), spoldf=map_crop, colspoldf="cornsilk")
+dev.off()
+
+```
+
+As expected, the trajectory got split in 3 segments: a first segment consisting in a large scale, directed movement (migration), a second segment consisting in a series of home-range restricted movements, and a third segment similar to the first one (another migration).
+
+## Segmentation based on Net Squared Displacement 
+
+Net Squared Displacement has been used as a parameter to identify migratory movements, although its usefuleness in accurately detecting migration is debated. Let's compare the results of the FPT segmentation with an NSD-based segmentation. We are going to apply Lavielle's method again, with the only difference that this time we will use NSD, not FPT as the path signal of choice.
+
+```{r nsd series}
+
+plotltr(traj_4370, which="R2n")
+
+```
+
+The time series plot of NSD for Wood Stork 1134370 is somewhat similar to the FPT one. We can still identify an initial segment with low NSD values (permanence in the surroundings of the starting point), a middle segment with high NSD values (movements in an area far from the starting point), and a final segment with low NSD values again (movements in an area close to the starting point). Let's proceed with the segmentation.
+
+```{r nsd seg, results="hide"}
+
+lav_4370 <- lavielle(traj_4370, Lmin=10, Kmax=10, type="mean", which="R2n")
+chooseseg(lav_4370)
+
+```
+
+The scree plot indicates 3 as the optimal number of segments, again.
+
+```{r split nsd, results="hide"}
+
+seg_4370 <- findpath(lav_4370, 3)
+plot(seg_4370)
+
+par(mfrow=c(1,3))
+plot(seg_4370[1],ylim=c(2800000,3700000),xlim=c(300000,700000))
+plot(seg_4370[2],ylim=c(2800000,3700000),xlim=c(300000,700000))
+plot(seg_4370[3],ylim=c(2800000,3700000),xlim=c(300000,700000))
+dev.off()
+
+```
+
+```{r split nsd map, results="hide"}
+
+par(mfrow=c(1,3))
+plot(seg_4370[1],ylim=c(2800000,3700000),xlim=c(300000,700000), spoldf=map_crop, colspoldf="cornsilk")
+plot(seg_4370[2],ylim=c(2800000,3700000),xlim=c(300000,700000), spoldf=map_crop, colspoldf="cornsilk")
+plot(seg_4370[3],ylim=c(2800000,3700000),xlim=c(300000,700000), spoldf=map_crop, colspoldf="cornsilk")
+dev.off()
+
+```
+
+The NSD-based segmentation yields slightly different results than the FPT-based one. In both cases, the trajectory gets split in 3 portions that are generally corresponding, but while the FPT markedly isolates the home range restricted movements from the large scale migrations, the NSD cuts the migratory movements in two, interrupting them approximately at the mid-point between the departure and arrival locations. This difference is the by-product of NSD being a purely spatial path signal, while the FPT takes into consideration the temporal dimension as well. While FPT measures the intensity of movements as time spent in an area, NSD measures the spatial displacement with respect to a reference location.
+
+# References
+
+The following list includes both papers that were directly referenced in the text and a few suggested readings for those who might be interested in digging deeper.
+
++ Barraquand, F., & Benhamou, S. (2008). Animal movements in heterogeneous landscapes: identifying profitable places and homogeneous movement bouts. Ecology, 89(12), 3336-3348.
+
++ Edelhoff, H., Signer, J., & Balkenhol, N. (2016). Path segmentation for beginners: an overview of current methods for detecting changes in animal movement patterns. Movement ecology, 4(1), 21.
+
++ Fauchald, P., & Tveraa, T. (2003). Using first???passage time in the analysis of area???restricted search and habitat selection. Ecology, 84(2), 282-288.
+
++ Gurarie, E., Bracis, C., Delgado, M., Meckley, T. D., Kojola, I., & Wagner, C. M. (2016). What is the animal doing? Tools for exploring behavioural structure in animal movements. Journal of Animal Ecology, 85(1), 69-84.
+
++ Lavielle, M. (1999). Detection of multiple changes in a sequence of dependent variables. Stochastic Processes and their Applications, 83(1), 79-102.
+
++ Lavielle, M. (2005). Using penalized contrasts for the change-point problem. Signal processing, 85(8), 1501-1510.
+
++ Le Corre, M., Pellerin, M., Pinaud, D., Van Laere, G., Fritz, H., & Sa??d, S. (2008). A multi-patch use of the habitat: testing the First-Passage Time analysis on roe deer Capreolus capreolus paths. Wildlife Biology, 14(3), 339-349.
